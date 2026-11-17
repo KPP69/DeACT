@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "feature/**"
+  pull_request:
+    branches:
+      - "foundation/portable-core"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: Windows x64 (MSVC)
+    runs-on: windows-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.100.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Release build (Windows x64 MSVC)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Upload DeACT.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeACT-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/deact.exe
+          if-no-files-found: error
+          retention-days: 14
