@@ -1,0 +1,19 @@
+[package]
+name = "deact"
+version = "0.1.0"
+edition = "2021"
+description = "DeACT — portable Windows desktop auto copy-trading application (foundation stage: no trading functionality yet)"
+default-run = "deact"
+
+[dependencies]
+eframe = "0.37"
+tokio = { version = "~1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "registry"] }
+
+[profile.release]
+# Keep release builds debuggable enough for a foundation-stage artifact.
+debug = false
