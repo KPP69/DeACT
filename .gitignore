@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+
+# DeACT portable runtime data (created beside DeACT.exe at first launch).
+# Never commit local databases, logs, caches, backups or credentials.
+/DeACT_Data/
+DeACT_Data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Logs
+*.log
+/logs/
+
+# Local sensitive configuration and authentication material.
+# Real API keys, Telegram sessions and other credentials must never be committed.
+*secret*.toml
+*credentials*.toml
+*.session
+*.key
+*.pem
+
+# Local temporary files
+*.tmp
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
