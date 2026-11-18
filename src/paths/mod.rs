@@ -9,8 +9,9 @@
 
 use std::error::Error;
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Name of the portable data directory beside the executable.
 pub const DATA_DIR_NAME: &str = "DeACT_Data";
@@ -29,6 +30,11 @@ pub enum PathsError {
     },
     /// The data directory exists but is not writable.
     NotWritable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The writability probe was created but could not be removed.
+    ProbeCleanupFailed {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -59,6 +65,13 @@ impl fmt::Display for PathsError {
                     path.display()
                 )
             }
+            PathsError::ProbeCleanupFailed { path, source } => {
+                write!(
+                    f,
+                    "could not remove writability probe {}: {source}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -68,7 +81,8 @@ impl Error for PathsError {
         match self {
             PathsError::ExePathUnavailable(source)
             | PathsError::CreateFailed { source, .. }
-            | PathsError::NotWritable { source, .. } => Some(source),
+            | PathsError::NotWritable { source, .. }
+            | PathsError::ProbeCleanupFailed { source, .. } => Some(source),
             PathsError::NoParentDirectory(_) => None,
         }
     }
@@ -176,27 +190,127 @@ fn ensure_data_dirs(paths: &PortablePaths) -> Result<(), PathsError> {
     }
     // Writability probe: create and remove a temporary file. This must not
     // be skipped — a directory that only looks writable is not enough.
-    let probe = paths.data_dir.join(".deact-write-test");
-    match fs::write(&probe, b"") {
-        Ok(()) => {
-            let _ = fs::remove_file(&probe);
-            Ok(())
+    let probe = create_write_probe(&paths.data_dir)?;
+    remove_write_probe(&probe)?;
+    Ok(())
+}
+
+/// Create a uniquely named, empty probe file with exclusive creation
+/// (`create_new`), so an existing file can never be overwritten or
+/// truncated — including a leftover probe from an earlier run. Only a
+/// name collision is retried; any other failure means the directory is
+/// not writable and is reported as such.
+fn create_write_probe(data_dir: &Path) -> Result<PathBuf, PathsError> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        let name = format!(
+            ".deact-write-test-{}-{}-{attempt}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0),
+        );
+        let probe = data_dir.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&probe) {
+            Ok(file) => {
+                drop(file);
+                return Ok(probe);
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_error = Some(source);
+            }
+            Err(source) => {
+                return Err(PathsError::NotWritable {
+                    path: data_dir.to_path_buf(),
+                    source,
+                });
+            }
         }
-        Err(source) => Err(PathsError::NotWritable {
-            path: paths.data_dir.clone(),
-            source,
-        }),
     }
+    Err(PathsError::NotWritable {
+        path: data_dir.to_path_buf(),
+        source: last_error.expect("at least one probe attempt ran"),
+    })
+}
+
+/// Remove the probe file. A failure is reported as
+/// [`PathsError::ProbeCleanupFailed`], never silently ignored: a probe
+/// left behind would pollute the user's data directory.
+fn remove_write_probe(probe: &Path) -> Result<(), PathsError> {
+    fs::remove_file(probe).map_err(|source| PathsError::ProbeCleanupFailed {
+        path: probe.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("deact-paths-unit-{tag}-{}-{n}", std::process::id()))
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = fs::remove_dir_all(path);
+    }
 
     #[test]
     fn data_dir_is_beside_the_executable() {
         let exe = Path::new("/tmp/somewhere/bin/DeACT.exe");
         let dir = data_dir_for_exe(exe).expect("data dir resolves");
         assert_eq!(dir, Path::new("/tmp/somewhere/bin/DeACT_Data"));
+    }
+
+    #[test]
+    fn probe_never_overwrites_an_existing_file() {
+        let base = unique_temp_dir("probe-keep");
+        let exe = base.join("bin").join("DeACT.exe");
+        let data_dir = base.join("bin").join("DeACT_Data");
+        fs::create_dir_all(&data_dir).expect("data dir");
+        // A file with the old fixed probe name must survive resolution
+        // untouched, with its contents intact.
+        let sentinel = data_dir.join(".deact-write-test");
+        fs::write(&sentinel, b"do not overwrite").expect("sentinel file");
+        let paths = resolve_for_exe(&exe).expect("resolution succeeds");
+        assert_eq!(
+            fs::read(&sentinel).expect("sentinel still readable"),
+            b"do not overwrite",
+            "the probe must not overwrite an existing file"
+        );
+        // No probe file is left behind: the only entries are the sentinel
+        // (which was already there) and the three subdirectories.
+        let mut entries: Vec<_> = fs::read_dir(paths.data_dir())
+            .expect("read data dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![".deact-write-test", "backups", "cache", "logs"]
+        );
+        cleanup(&base);
+    }
+
+    #[test]
+    fn probe_cleanup_failure_is_reported() {
+        // `remove_file` on a directory fails deterministically (even for a
+        // privileged user, where permission bits alone would not block
+        // removal), which exercises the cleanup-error path.
+        let base = unique_temp_dir("probe-cleanup");
+        let dir = base.join("not-a-file");
+        fs::create_dir_all(&dir).expect("directory");
+        match remove_write_probe(&dir) {
+            Err(PathsError::ProbeCleanupFailed { path, .. }) => {
+                assert_eq!(path, dir);
+            }
+            other => panic!("expected ProbeCleanupFailed, got {other:?}"),
+        }
+        cleanup(&base);
     }
 }
