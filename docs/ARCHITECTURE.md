@@ -17,7 +17,8 @@ real-money functionality.
 - UI: eframe / egui 0.37, native desktop. No WebView/WebView2 runtime.
 - Async: Tokio 1.53 (`rt-multi-thread`, `macros`, `sync`, `time`).
 - Database: rusqlite 0.43 with `bundled`, SQLite WAL mode.
-- Config: Serde + TOML. Logging: `tracing` + `tracing-subscriber`.
+- Config: Serde + TOML. Logging: `tracing` + `tracing-subscriber` +
+  `tracing-appender` (non-blocking file writer).
 - `Cargo.lock` is committed; dependency versions are whatever Cargo
   resolved at build time (see the lock file for exact versions).
 
@@ -40,9 +41,17 @@ src/
 │                  creation of DeACT_Data/ plus logs/, cache/, backups/.
 ├── storage/       SQLite access through exactly one worker thread fed by
 │                  a bounded channel. WAL mode, busy timeout, `meta`
-│                  table with schema_version.
+│                  table with schema_version. The worker exposes only
+│                  typed operations (`schema_version`, `journal_mode`,
+│                  `get_meta`, `set_meta`); no arbitrary SQL is exposed
+│                  to any caller, and every statement uses parameter
+│                  binding. Schema-version errors distinguish a missing
+│                  row, a malformed value, and a failed query.
 └── logging/       tracing subscriber: console (ANSI) + DeACT_Data/logs/
-                   deact.log (no ANSI, appended).
+                   deact.log (no ANSI, appended) through a non-blocking
+                   writer; the `LogGuard` holds the appender's
+                   `WorkerGuard`, so dropping it at shutdown flushes
+                   buffered records and joins the writer thread.
 ```
 
 Dependency direction: `main` → `app`, `runtime`, `config`, `paths`,
@@ -62,7 +71,10 @@ receives an `AppStatus` snapshot). `storage`, `runtime`, `config`,
   - `DeACT_Data/cache/` — cache (currently unused).
   - `DeACT_Data/backups/` — backups (currently unused).
 - At startup the directories are created and writability is proven by
-  creating and removing a probe file. If the executable directory is not
+  creating and removing a uniquely named probe file with exclusive
+  creation (`OpenOptions::create_new`), so an existing file is never
+  overwritten; a probe that cannot be removed is reported as an error
+  instead of being silently ignored. If the executable directory is not
   writable, startup fails with a clear error and the process exits.
   There is no fallback to another location.
 
@@ -89,6 +101,15 @@ receives an `AppStatus` snapshot). `storage`, `runtime`, `config`,
   `schema_version = 1` (`INSERT OR IGNORE`, so reopening is safe).
 - `DbWorker::open` blocks until the worker reports initialisation success
   or failure, so a bad database fails startup instead of failing later.
+- The worker's public API is typed only: `schema_version()`,
+  `journal_mode()`, `get_meta(key)` and `set_meta(key, value)`. There is
+  no method that accepts an SQL string, so no other module can run
+  arbitrary SQL; the worker's own statements are fixed text with
+  parameter binding.
+- `schema_version()` distinguishes its failure modes: a missing
+  `schema_version` row is `MissingSchemaVersion`, a stored value that is
+  not an integer is `InvalidSchemaVersion` (carrying the stored text),
+  and a query that fails returns the underlying SQLite error.
 - The worker stops on an explicit `Shutdown` request, on channel close,
   or when dropped (`shutdown()` is idempotent and joins the thread).
 
@@ -112,12 +133,19 @@ state.
 ## 7. Testing
 
 - `tests/paths_tests.rs` — data directory resolution, directory
-  creation, unwritable-location failure.
+  creation, unwritable-location failure, and the writability probe
+  never overwriting an existing file and leaving no probe behind.
+  Unit tests in `src/paths/mod.rs` also cover probe cleanup failure
+  being reported.
 - `tests/config_tests.rs` — default generation, loading an existing
   file, corrupt file reported and left untouched.
 - `tests/storage_tests.rs` — first initialisation (schema version 1,
-  WAL mode), repeat initialisation, worker writes with read-back,
-  invalid SQL reported, requests after shutdown fail.
+  WAL mode), repeat initialisation, typed meta writes with read-back
+  through the worker, requests after shutdown fail. Unit tests in
+  `src/storage/mod.rs` cover the meta round trip and the three
+  `schema_version` error kinds (missing row, malformed value, failed
+  query) by corrupting the database through a second connection that
+  exists only inside those tests.
 - `tests/runtime_tests.rs` — start, ping, shutdown, idempotent shutdown.
 - Tests use unique temporary directories under the OS temp directory and
   never touch a real `DeACT_Data/`.
