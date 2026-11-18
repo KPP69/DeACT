@@ -97,8 +97,14 @@ receives an `AppStatus` snapshot). `storage`, `runtime`, `config`,
   (capacity 64) and carry a reply channel. Callers block for the reply;
   the UI thread never calls the worker.
 - On open the worker sets `journal_mode = WAL`, `busy_timeout = 5000`,
-  `foreign_keys = ON`, creates the `meta` table and inserts
-  `schema_version = 1` (`INSERT OR IGNORE`, so reopening is safe).
+  `foreign_keys = ON`. Initialisation then depends on what the database
+  already holds: only a fresh database (no user tables at all) gets its
+  `meta` table created and `schema_version = 1` seeded, in one
+  transaction. An existing database is never re-seeded — a `meta` table
+  that exists but has no `schema_version` row keeps that missing state,
+  and `schema_version()` reports `MissingSchemaVersion`. A database
+  that already holds tables but has no `meta` table is rejected with
+  `IncompleteDatabase` instead of being rebuilt as if it were new.
 - `DbWorker::open` blocks until the worker reports initialisation success
   or failure, so a bad database fails startup instead of failing later.
 - The worker's public API is typed only: `schema_version()`,
@@ -142,10 +148,15 @@ state.
 - `tests/storage_tests.rs` — first initialisation (schema version 1,
   WAL mode), repeat initialisation, typed meta writes with read-back
   through the worker, requests after shutdown fail. Unit tests in
-  `src/storage/mod.rs` cover the meta round trip and the three
+  `src/storage/mod.rs` cover the meta round trip, the three
   `schema_version` error kinds (missing row, malformed value, failed
-  query) by corrupting the database through a second connection that
-  exists only inside those tests.
+  query), and two regression tests —
+  `reopening_after_schema_version_deleted_reports_missing` (a deleted
+  version row is not restored on reopen) and
+  `existing_tables_without_meta_are_not_treated_as_new` (a database
+  with tables but no `meta` table is rejected, not rebuilt) — by
+  corrupting the database through a second connection that exists only
+  inside those tests.
 - `tests/runtime_tests.rs` — start, ping, shutdown, idempotent shutdown.
 - Tests use unique temporary directories under the OS temp directory and
   never touch a real `DeACT_Data/`.
