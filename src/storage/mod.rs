@@ -7,6 +7,13 @@
 //! schema version in a `meta` table so future migrations have a base to
 //! build on. This stage only establishes the database foundation; it does
 //! not design trading tables.
+//!
+//! The worker exposes only typed operations ([`DbWorker::schema_version`],
+//! [`DbWorker::journal_mode`], [`DbWorker::get_meta`],
+//! [`DbWorker::set_meta`]). There is deliberately no public API that
+//! accepts an arbitrary SQL string: callers cannot smuggle SQL past the
+//! storage layer, and every statement the worker runs is fixed text with
+//! parameter binding.
 
 use std::error::Error;
 use std::fmt;
@@ -14,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Maximum number of database requests waiting for the worker.
 const CHANNEL_CAPACITY: usize = 64;
@@ -22,7 +29,7 @@ const CHANNEL_CAPACITY: usize = 64;
 /// Errors from the storage layer.
 #[derive(Debug)]
 pub enum StorageError {
-    /// An SQLite operation failed.
+    /// An SQLite operation failed. The underlying error is preserved.
     Sqlite(rusqlite::Error),
     /// The worker thread is gone or its channel is closed.
     WorkerUnavailable,
@@ -30,6 +37,8 @@ pub enum StorageError {
     ReplyFailed,
     /// The `meta` table has no `schema_version` entry.
     MissingSchemaVersion,
+    /// The `schema_version` entry exists but is not a valid integer.
+    InvalidSchemaVersion(String),
 }
 
 impl fmt::Display for StorageError {
@@ -44,6 +53,9 @@ impl fmt::Display for StorageError {
             }
             StorageError::MissingSchemaVersion => {
                 write!(f, "database has no schema_version entry")
+            }
+            StorageError::InvalidSchemaVersion(value) => {
+                write!(f, "schema_version entry is not a valid integer: {value:?}")
             }
         }
     }
@@ -64,7 +76,9 @@ impl From<rusqlite::Error> for StorageError {
     }
 }
 
-/// One request to the database worker.
+/// One request to the database worker. SQL strings never cross this
+/// boundary: every variant carries typed values, and the worker runs only
+/// fixed statements with parameter binding.
 enum DbRequest {
     SchemaVersion {
         reply: Sender<Result<i64, StorageError>>,
@@ -72,15 +86,15 @@ enum DbRequest {
     JournalMode {
         reply: Sender<Result<String, StorageError>>,
     },
-    /// Run one SQL statement and return the first column of the first row,
-    /// if any. Used by tests and by future read paths.
-    QueryOneText {
-        sql: String,
+    /// Read one `meta` value by key (`None` when the key is absent).
+    GetMeta {
+        key: String,
         reply: Sender<Result<Option<String>, StorageError>>,
     },
-    /// Run SQL that returns no rows (DDL / INSERT / UPDATE / DELETE).
-    Execute {
-        sql: String,
+    /// Insert or replace one `meta` value.
+    SetMeta {
+        key: String,
+        value: String,
         reply: Sender<Result<(), StorageError>>,
     },
     Shutdown,
@@ -137,21 +151,24 @@ impl DbWorker {
         reply_rx.recv().map_err(|_| StorageError::ReplyFailed)?
     }
 
-    /// Run one SQL statement and return the first column of the first row.
-    pub fn query_one_text(&self, sql: &str) -> Result<Option<String>, StorageError> {
+    /// Read a `meta` value by key. Returns `Ok(None)` when the key is
+    /// absent; a missing key is not an error.
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, StorageError> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.send(DbRequest::QueryOneText {
-            sql: sql.to_string(),
+        self.send(DbRequest::GetMeta {
+            key: key.to_string(),
             reply: reply_tx,
         })?;
         reply_rx.recv().map_err(|_| StorageError::ReplyFailed)?
     }
 
-    /// Run SQL that returns no rows.
-    pub fn execute(&self, sql: &str) -> Result<(), StorageError> {
+    /// Insert or replace a `meta` value. This is the only public write
+    /// operation besides initialisation; all writes go through the worker.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), StorageError> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.send(DbRequest::Execute {
-            sql: sql.to_string(),
+        self.send(DbRequest::SetMeta {
+            key: key.to_string(),
+            value: value.to_string(),
             reply: reply_tx,
         })?;
         reply_rx.recv().map_err(|_| StorageError::ReplyFailed)?
@@ -233,14 +250,26 @@ fn serve(connection: Connection, rx: Receiver<DbRequest>) {
                     .map_err(StorageError::from);
                 let _ = reply.send(result);
             }
-            DbRequest::QueryOneText { sql, reply } => {
+            DbRequest::GetMeta { key, reply } => {
                 let result = connection
-                    .query_row(&sql, [], |row| row.get::<_, Option<String>>(0))
+                    .query_row(
+                        "SELECT value FROM meta WHERE key = ?1",
+                        params![key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
                     .map_err(StorageError::from);
                 let _ = reply.send(result);
             }
-            DbRequest::Execute { sql, reply } => {
-                let result = connection.execute_batch(&sql).map_err(StorageError::from);
+            DbRequest::SetMeta { key, value, reply } => {
+                let result = connection
+                    .execute(
+                        "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        params![key, value],
+                    )
+                    .map(|_| ())
+                    .map_err(StorageError::from);
                 let _ = reply.send(result);
             }
             DbRequest::Shutdown => break,
@@ -248,6 +277,13 @@ fn serve(connection: Connection, rx: Receiver<DbRequest>) {
     }
 }
 
+/// Read the schema version, distinguishing the three failure modes
+/// instead of collapsing them into one error:
+/// - no `schema_version` row: [`StorageError::MissingSchemaVersion`];
+/// - the query itself fails (for example the `meta` table is gone):
+///   [`StorageError::Sqlite`], with the underlying error preserved;
+/// - the stored value is not an integer:
+///   [`StorageError::InvalidSchemaVersion`], carrying the stored text.
 fn schema_version(connection: &Connection) -> Result<i64, StorageError> {
     let value: Option<String> = connection
         .query_row(
@@ -255,11 +291,121 @@ fn schema_version(connection: &Connection) -> Result<i64, StorageError> {
             [],
             |row| row.get(0),
         )
-        .ok();
+        .optional()?;
     match value {
         Some(text) => text
             .parse::<i64>()
-            .map_err(|_| StorageError::MissingSchemaVersion),
+            .map_err(|_| StorageError::InvalidSchemaVersion(text)),
         None => Err(StorageError::MissingSchemaVersion),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "deact-storage-unit-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// A second, direct connection to the same database file, used only
+    /// inside these tests to corrupt the database and prove the worker
+    /// reports each failure kind correctly. Production code never opens
+    /// a second connection and never runs caller-supplied SQL.
+    fn raw_connection(db_path: &Path) -> Connection {
+        let connection = Connection::open(db_path).expect("raw connection opens");
+        connection
+            .pragma_update(None, "busy_timeout", 5000)
+            .expect("busy timeout set");
+        connection
+    }
+
+    #[test]
+    fn worker_meta_round_trip() {
+        let base = unique_temp_dir("meta");
+        std::fs::create_dir_all(&base).expect("base dir");
+        let db_path = base.join("deact.db");
+        let worker = DbWorker::open(&db_path).expect("database opens");
+        assert_eq!(
+            worker.get_meta("probe").expect("meta read"),
+            None,
+            "a missing key is None, not an error"
+        );
+        worker.set_meta("probe", "hello").expect("meta write");
+        assert_eq!(
+            worker.get_meta("probe").expect("meta read back"),
+            Some("hello".to_string())
+        );
+        worker.set_meta("probe", "world").expect("meta overwrite");
+        assert_eq!(
+            worker.get_meta("probe").expect("meta read after overwrite"),
+            Some("world".to_string())
+        );
+        assert_eq!(
+            worker
+                .schema_version()
+                .expect("version untouched by meta writes"),
+            1
+        );
+        drop(worker);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn worker_schema_version_errors_are_distinguished() {
+        let base = unique_temp_dir("version-errors");
+        std::fs::create_dir_all(&base).expect("base dir");
+        let db_path = base.join("deact.db");
+        let worker = DbWorker::open(&db_path).expect("database opens");
+
+        // 1. The row is gone: MissingSchemaVersion.
+        raw_connection(&db_path)
+            .execute("DELETE FROM meta WHERE key = 'schema_version'", [])
+            .expect("delete schema_version row");
+        assert!(
+            matches!(
+                worker.schema_version(),
+                Err(StorageError::MissingSchemaVersion)
+            ),
+            "a missing schema_version row must be MissingSchemaVersion"
+        );
+
+        // 2. The row exists but is not an integer: InvalidSchemaVersion.
+        raw_connection(&db_path)
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', 'not-a-number')",
+                [],
+            )
+            .expect("insert malformed schema_version row");
+        match worker.schema_version() {
+            Err(StorageError::InvalidSchemaVersion(value)) => {
+                assert_eq!(value, "not-a-number");
+            }
+            other => panic!("expected InvalidSchemaVersion, got {other:?}"),
+        }
+
+        // 3. The query itself fails: the underlying SQLite error, not a
+        // generic "missing version" error.
+        raw_connection(&db_path)
+            .execute("DROP TABLE meta", [])
+            .expect("drop meta table");
+        assert!(
+            matches!(worker.schema_version(), Err(StorageError::Sqlite(_))),
+            "a failed schema_version query must surface the SQLite error"
+        );
+
+        drop(worker);
+        cleanup(&base);
     }
 }
