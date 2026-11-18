@@ -3,17 +3,23 @@
 //! Logging is initialised once at startup. Log records never contain API
 //! keys, sessions, signatures or complete authentication requests —
 //! callers must not log such values, and this module performs no redaction
-//! of message contents beyond that rule. File I/O happens on the logging
-//! subscriber's own path, never on the UI thread.
+//! of message contents beyond that rule.
+//!
+//! File logging is non-blocking: log records are sent over a channel to a
+//! dedicated writer thread owned by `tracing-appender`, so a slow disk
+//! never blocks the thread that emitted the log record (including the UI
+//! thread). The [`LogGuard`] holds the [`WorkerGuard`]; when the guard is
+//! dropped at shutdown, the writer thread is joined and any buffered
+//! records are flushed before the process exits.
 
 use std::error::Error;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
 
-use tracing_subscriber::fmt::MakeWriter;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling;
 use tracing_subscriber::prelude::*;
 
 /// Errors that can occur while initialising logging.
@@ -45,12 +51,15 @@ impl Error for LoggingError {
     }
 }
 
-/// Keeps the log file path for diagnostics. The log file itself is owned
-/// by the global `tracing` subscriber (via `FileMakeWriter`), so it stays
-/// alive for the lifetime of the process. Drop the guard only at shutdown.
+/// Holds the log file path and the `tracing-appender` worker guard. The
+/// guard must stay alive for as long as logging is used: dropping it
+/// flushes the remaining buffered records and joins the background writer
+/// thread. `main` keeps this guard until the process exits, so no log
+/// record is lost at shutdown.
 #[derive(Debug)]
 pub struct LogGuard {
     path: PathBuf,
+    _worker_guard: WorkerGuard,
 }
 
 impl LogGuard {
@@ -60,52 +69,26 @@ impl LogGuard {
     }
 }
 
-/// A `MakeWriter` that hands out a locked handle to the shared log file.
-#[derive(Debug, Clone)]
-struct FileMakeWriter {
-    file: Arc<Mutex<File>>,
-}
-
-impl<'a> MakeWriter<'a> for FileMakeWriter {
-    type Writer = LockedFileWriter<'a>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        let guard = self
-            .file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        LockedFileWriter { guard }
-    }
-}
-
-/// `io::Write` over a locked `File`.
-struct LockedFileWriter<'a> {
-    guard: MutexGuard<'a, File>,
-}
-
-impl io::Write for LockedFileWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.guard.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.guard.flush()
-    }
-}
-
 /// Initialise the global `tracing` subscriber: human-readable output to
 /// the console (with ANSI colours) and to `deact.log` in `logs_dir`
-/// (without ANSI colours, appended). Fails loudly when the log file cannot
-/// be opened; callers must treat that as a startup failure.
+/// (without ANSI colours, appended) through a non-blocking writer. Fails
+/// loudly when the log file cannot be opened; callers must treat that as
+/// a startup failure.
 pub fn init(logs_dir: &Path) -> Result<LogGuard, LoggingError> {
     std::fs::create_dir_all(logs_dir).map_err(LoggingError::Io)?;
     let path = logs_dir.join("deact.log");
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(LoggingError::Io)?;
-    let file = Arc::new(Mutex::new(file));
+    // Open the file eagerly so a permission or disk problem is reported
+    // at startup instead of surfacing only on the first log write. The
+    // appender below opens the same file in append mode.
+    drop(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(LoggingError::Io)?,
+    );
+    let file_appender = rolling::never(logs_dir, "deact.log");
+    let (non_blocking, worker_guard) = tracing_appender::non_blocking(file_appender);
 
     let subscriber = tracing_subscriber::registry()
         .with(
@@ -115,11 +98,14 @@ pub fn init(logs_dir: &Path) -> Result<LogGuard, LoggingError> {
         )
         .with(
             tracing_subscriber::fmt::Layer::default()
-                .with_writer(FileMakeWriter { file })
+                .with_writer(non_blocking)
                 .with_ansi(false),
         );
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|source| LoggingError::AlreadyInitialised(source.to_string()))?;
 
-    Ok(LogGuard { path })
+    Ok(LogGuard {
+        path,
+        _worker_guard: worker_guard,
+    })
 }
