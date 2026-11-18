@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "registry"] }
+tracing-appender = "0.2"
 
 [profile.release]
 # Keep release builds debuggable enough for a foundation-stage artifact.
