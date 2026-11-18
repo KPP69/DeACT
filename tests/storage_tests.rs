@@ -1,5 +1,8 @@
 //! SQLite tests: first initialisation, repeat initialisation, WAL mode,
-//! worker writes and error handling.
+//! typed meta writes through the worker, and requests after shutdown.
+//! Error-kind distinctions for schema_version are covered by unit tests
+//! inside the storage module, where a second connection may corrupt the
+//! database; no test (and no production code) runs caller-supplied SQL.
 
 #[path = "common.rs"]
 mod common;
@@ -48,25 +51,34 @@ fn sqlite_repeat_initialisation_keeps_version() {
 }
 
 #[test]
-fn database_worker_writes_and_reports_errors() {
+fn database_worker_meta_writes_and_reads_back() {
     let base = unique_temp_dir("storage-worker");
     fs::create_dir_all(&base).expect("base dir");
     let db_path = base.join("deact.db");
     let worker = DbWorker::open(&db_path).expect("database opens");
+    assert_eq!(
+        worker.get_meta("probe").expect("meta read"),
+        None,
+        "a missing key is None, not an error"
+    );
     worker
-        .execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, label TEXT NOT NULL)")
-        .expect("worker executes DDL");
+        .set_meta("probe", "hello")
+        .expect("worker writes a meta value");
+    assert_eq!(
+        worker.get_meta("probe").expect("meta read back"),
+        Some("hello".to_string()),
+        "written value reads back through the worker"
+    );
     worker
-        .execute("INSERT INTO probe (id, label) VALUES (1, 'hello')")
-        .expect("worker executes INSERT");
-    let value = worker
-        .query_one_text("SELECT label FROM probe WHERE id = 1")
-        .expect("worker executes SELECT");
-    assert_eq!(value.as_deref(), Some("hello"), "written row reads back");
-    let bad = worker.execute("INSERT INTO no_such_table VALUES (1)");
-    assert!(bad.is_err(), "invalid SQL must be reported, not swallowed");
-    // The worker must still work after an error.
-    assert_eq!(worker.schema_version().expect("version after error"), 1);
+        .set_meta("probe", "world")
+        .expect("worker overwrites a meta value");
+    assert_eq!(
+        worker.get_meta("probe").expect("meta read after overwrite"),
+        Some("world".to_string())
+    );
+    // The worker must still work after meta writes, and the schema
+    // version must be untouched by them.
+    assert_eq!(worker.schema_version().expect("version after writes"), 1);
     drop(worker);
     cleanup(&base);
 }
