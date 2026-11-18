@@ -39,6 +39,9 @@ pub enum StorageError {
     MissingSchemaVersion,
     /// The `schema_version` entry exists but is not a valid integer.
     InvalidSchemaVersion(String),
+    /// The database already contains tables but is missing the required
+    /// `meta` table, so it cannot be initialised as a new database.
+    IncompleteDatabase,
 }
 
 impl fmt::Display for StorageError {
@@ -56,6 +59,14 @@ impl fmt::Display for StorageError {
             }
             StorageError::InvalidSchemaVersion(value) => {
                 write!(f, "schema_version entry is not a valid integer: {value:?}")
+            }
+            StorageError::IncompleteDatabase => {
+                write!(
+                    f,
+                    "database is incomplete: it contains tables but is \
+                     missing the required meta table; refusing to \
+                     initialise it as a new database"
+                )
             }
         }
     }
@@ -109,8 +120,11 @@ pub struct DbWorker {
 
 impl DbWorker {
     /// Open (or create) the database at `db_path`, enable WAL, set a busy
-    /// timeout, and create the `meta` table with `schema_version = 1`.
-    /// Returns an error promptly when initialisation fails.
+    /// timeout, and create the `meta` table with `schema_version = 1`
+    /// when the database is new. An existing database is never re-seeded:
+    /// its recorded version is kept, and a database that already holds
+    /// tables but has no `meta` table is rejected instead of being
+    /// rebuilt. Returns an error promptly when initialisation fails.
     pub fn open(db_path: &Path) -> Result<Self, StorageError> {
         let (tx, rx) = sync_channel::<DbRequest>(CHANNEL_CAPACITY);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StorageError>>();
@@ -220,21 +234,58 @@ fn worker_main(
     }
 }
 
-/// Open the connection, enable WAL, set a busy timeout and create the
-/// `meta` table with the initial schema version.
+/// Open the connection, enable WAL, and set a busy timeout. Then:
+/// - a fresh database (no user tables at all) gets its schema created
+///   and `schema_version = 1` seeded, in one transaction, so a crash
+///   cannot leave a half-initialised database behind;
+/// - an existing database that already has a `meta` table is left
+///   untouched — its recorded version is never re-inserted, so a
+///   deleted `schema_version` row stays deleted and is reported by
+///   `schema_version()` instead of being silently restored;
+/// - an existing database that holds tables but has no `meta` table is
+///   rejected as incomplete instead of being rebuilt as if it were new.
 fn initialise(db_path: &Path) -> Result<Connection, StorageError> {
-    let connection = Connection::open(db_path)?;
+    let mut connection = Connection::open(db_path)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "busy_timeout", 5000)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS meta (\
-            key TEXT PRIMARY KEY, \
-            value TEXT NOT NULL\
-        );\
-        INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');",
-    )?;
+    if is_fresh_database(&connection)? {
+        let tx = connection.transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (\
+                key TEXT PRIMARY KEY, \
+                value TEXT NOT NULL\
+            );\
+            INSERT INTO meta (key, value) VALUES ('schema_version', '1');",
+        )?;
+        tx.commit()?;
+    } else if !meta_table_exists(&connection)? {
+        return Err(StorageError::IncompleteDatabase);
+    }
     Ok(connection)
+}
+
+/// A database is fresh only when it holds no user tables at all.
+/// Checking the `meta` table alone would misjudge a database that has
+/// other tables but lost its `meta` table.
+fn is_fresh_database(connection: &Connection) -> Result<bool, StorageError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count == 0)
+}
+
+fn meta_table_exists(connection: &Connection) -> Result<bool, StorageError> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'table' AND name = 'meta'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 fn serve(connection: Connection, rx: Receiver<DbRequest>) {
@@ -406,6 +457,94 @@ mod tests {
         );
 
         drop(worker);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn reopening_after_schema_version_deleted_reports_missing() {
+        let base = unique_temp_dir("version-deleted");
+        std::fs::create_dir_all(&base).expect("base dir");
+        let db_path = base.join("deact.db");
+        {
+            let worker = DbWorker::open(&db_path).expect("database opens");
+            assert_eq!(worker.schema_version().expect("version"), 1);
+        }
+        // Simulate a damaged database: delete the version row with a
+        // test-only connection, then close that connection.
+        {
+            let connection = raw_connection(&db_path);
+            connection
+                .execute("DELETE FROM meta WHERE key = 'schema_version'", [])
+                .expect("delete schema_version row");
+        }
+        // Reopening must succeed, and must not restore the deleted row.
+        let worker = DbWorker::open(&db_path).expect("reopen succeeds");
+        assert_eq!(
+            worker.get_meta("schema_version").expect("meta read"),
+            None,
+            "the deleted schema_version row must not be restored on reopen"
+        );
+        assert!(
+            matches!(
+                worker.schema_version(),
+                Err(StorageError::MissingSchemaVersion)
+            ),
+            "a deleted schema_version row must be MissingSchemaVersion"
+        );
+        drop(worker);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn existing_tables_without_meta_are_not_treated_as_new() {
+        let base = unique_temp_dir("tables-no-meta");
+        std::fs::create_dir_all(&base).expect("base dir");
+        let db_path = base.join("deact.db");
+        {
+            let connection = raw_connection(&db_path);
+            connection
+                .execute(
+                    "CREATE TABLE user_data (id INTEGER PRIMARY KEY, label TEXT NOT NULL)",
+                    [],
+                )
+                .expect("create user table");
+            connection
+                .execute(
+                    "INSERT INTO user_data (id, label) VALUES (1, 'keep me')",
+                    [],
+                )
+                .expect("insert user row");
+        }
+        assert!(
+            matches!(
+                DbWorker::open(&db_path),
+                Err(StorageError::IncompleteDatabase)
+            ),
+            "a database with tables but no meta table must be rejected, \
+             not initialised as new"
+        );
+        // The database must not have been rebuilt: still no `meta`
+        // table, and the user's table and row are untouched.
+        let connection = raw_connection(&db_path);
+        let meta_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'meta'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("meta table check");
+        assert_eq!(
+            meta_count, 0,
+            "initialisation must not recreate the meta table"
+        );
+        let label: String = connection
+            .query_row("SELECT label FROM user_data WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("user row still readable");
+        assert_eq!(label, "keep me", "user data must be untouched");
+        drop(connection);
         cleanup(&base);
     }
 }
