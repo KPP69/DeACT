@@ -15,10 +15,10 @@ product owner (requirements). Implementation follows
 
 | Area | Decision |
 |---|---|
-| Desktop framework | Tauri 2 (see §3.3 for the minimum version) |
+| Desktop framework | Tauri 2 (see §3.3 for the minimum version and §3.5 for version locking) |
 | Frontend | Svelte + TypeScript, plain CSS |
 | Core language | Rust |
-| Async runtime | Tokio |
+| Async runtime | Tokio, provided by Tauri 2; application background tasks run on it — no second independent Tokio runtime by default (§4) |
 | Database | SQLite, WAL mode |
 | Database access | Rust SQLite via the existing single-writer worker design (§9.3); migration cost to be evaluated in Phase 1 of the development plan |
 | External networking | REST + WebSocket (exchange APIs, webhook signal source). The desktop UI does **not** use REST/WebSocket; it uses Tauri Commands and Events (§4) |
@@ -107,8 +107,8 @@ Researched against the Tauri 2 documentation and release notes on
 
 - `app > appDirectoriesOverride` exists in **Tauri 2.12.0 and later**
   (added in 2.12.0, PR #14620). The migration must therefore use
-  **Tauri ≥ 2.12.0**, pinned exactly in `Cargo.lock` / `package.json`
-  at migration time. The override can be set in `tauri.conf.json` or at
+  **Tauri ≥ 2.12.0**, with the actually used versions locked as §3.5
+  specifies. The override can be set in `tauri.conf.json` or at
   runtime through `Context::config_mut`.
 - The override replaces the directories returned by the `app_config_dir`,
   `app_data_dir`, `app_local_data_dir`, `app_cache_dir` and
@@ -127,11 +127,15 @@ Researched against the Tauri 2 documentation and release notes on
   value is resolved relative to LocalAppData, so it cannot by itself
   place the WebView2 user data folder beside the executable. The Rust
   builder API (`WebviewWindowBuilder::data_directory`, absolute
-  `PathBuf`) can. DeACT therefore plans to create its main window from
-  Rust with an explicit `data_directory` of `data/webview/`, or to rely
-  on the override-driven default — the choice is made and verified in
-  Phase 1, on a real Windows machine, by inspecting where WebView2
-  actually writes.
+  `PathBuf`) can. **Decision:** DeACT creates its main window from Rust
+  with `WebviewWindowBuilder::data_directory` set to the absolute path
+  `<executable directory>/data/webview/`, computed from
+  `current_exe()`; the JSON `dataDirectory` config is not used.
+  `appDirectoriesOverride` is still used for the Tauri app-directory
+  APIs. This decision does not remove the verification duty: Phases 1
+  and 8 verify on a real Windows machine where WebView2 actually
+  writes, including whether any WebView2 component writes outside the
+  configured folder.
 - The override only covers paths resolved through the Tauri path APIs.
   Code or third-party dependencies that resolve paths on their own
   (environment variables, `dirs`-style lookups, hardcoded system paths)
@@ -147,6 +151,29 @@ must live at `data/webview/` per §3.2 — the runtime being a system
 component does not exempt its data folder from the portability rules.
 Behaviour when no WebView2 Runtime is present on the machine must be a
 clear startup error, verified in Phase 8.
+
+### 3.5 Version locking
+
+Four different things are versioned, and they are locked separately:
+
+- The Rust `tauri` crate and the whole Rust dependency tree are locked
+  exactly by `Cargo.lock`, which is committed; builds use the locked
+  versions.
+- The frontend Tauri API package (`@tauri-apps/api`): `package.json`
+  holds version *ranges*, which are not locks. The exact resolved
+  versions are locked by the JavaScript lockfile of the package
+  manager chosen in Phase 1 (for example `package-lock.json` or
+  `pnpm-lock.yaml`). The lockfile is committed, the chosen manager is
+  recorded in Phase 1's notes, and CI installs with that manager's
+  frozen/immutable mode.
+- The Tauri CLI is pinned as a frontend devDependency (so the same
+  lockfile covers it) or, if installed through Cargo, at a recorded
+  exact version. An unpinned, globally installed CLI must not produce
+  release builds.
+- The guarantee that matters: the lockfiles resolve Tauri to
+  ≥ 2.12.0 — the versions that provide `appDirectoriesOverride` — and
+  CI builds from the lockfiles, so the feature cannot silently
+  disappear through drift or a downgrade.
 
 ## 4. Architecture layers
 
@@ -171,8 +198,17 @@ backend. The modules are:
    per-exchange implementations (§6).
 8. **Storage** — SQLite access, transactions, persistence (§9).
 9. **Recovery Manager** — startup recovery, order recovery, exchange
-   reconciliation (§7.4).
+   reconciliation (§7.5).
 10. **Logging** — `tracing` logs and audit records.
+
+Runtime model: application background work (signal receiving, exchange
+connections, supervision) runs as async tasks on the async runtime
+provided by Tauri (Tokio). DeACT does not create a second, independent
+Tokio runtime by default. The foundation's design ideas — bounded
+channels with explicit overload behaviour, supervisor tasks, health
+checks — are kept on top of that runtime. The one exception is storage:
+SQLite runs on its own dedicated synchronous worker thread (§9.3), and
+blocking database calls never run on Tokio worker threads.
 
 Binding rules:
 
@@ -197,9 +233,18 @@ platforms can be added later without changing the Copy Engine.
 A signal source only receives and converts messages. It never operates
 a trading account and never places an order.
 
-### 5.2 Normalised signals and raw records
+### 5.2 Raw records, normalised signals and the Signal model
 
-Normalised signal kinds, at minimum:
+Every received message is persisted as a raw record in `signal_events`
+(§9): source type, source instance ID, original message ID, original
+message content, source timestamp, receive timestamp and parse status.
+Parsing produces a normalised Signal, persisted in `parsed_signals`
+and referencing its raw record. Handling and execution decisions are
+audited in `signal_logs`. Signal source *configuration* lives in
+`signal_sources`. The four tables have separate, non-overlapping
+responsibilities (§9.1).
+
+Normalised signal kinds (the Signal's `action`), at minimum:
 
 - `Open`
 - `Close`
@@ -208,12 +253,37 @@ Normalised signal kinds, at minimum:
 - `LeverageChange`
 - `Cancel`
 
-Every raw signal is persisted with: source type, source instance ID,
-original message ID, original message content, source timestamp,
-receive timestamp, parse status, and the normalisation result.
+A normalised Signal carries, as applicable:
 
-A message whose trading intent cannot be identified with certainty must
-not be guessed into an order. It is recorded and surfaced for review.
+- signal ID (assigned by DeACT);
+- source type and source instance ID;
+- trader ID (the signal provider's identity within the source);
+- original message ID (joining back to the raw record);
+- exchange;
+- trading instrument / symbol;
+- direction (long / short);
+- action (one of the kinds above);
+- quantity;
+- quantity semantics — what the quantity means (base amount, quote
+  amount, fraction of balance or of position), stated explicitly,
+  never implied;
+- target position **or** position delta — these are different
+  instructions and are never conflated: a target position states the
+  desired end position, a delta states a change relative to the
+  current position; a Signal uses one or the other and the field used
+  is explicit;
+- leverage;
+- entry price / price conditions;
+- take profit;
+- stop loss;
+- source timestamp and receive timestamp;
+- parse status.
+
+Not every signal kind carries every field (a `Cancel` may carry only
+its target reference), but every field's semantics are fixed by this
+model. A message whose trading intent cannot be identified with
+certainty is recorded with a failed or ambiguous parse status and is
+never executed automatically; it is surfaced for review.
 
 ### 5.3 Telegram
 
@@ -271,14 +341,37 @@ is safe. This is the primary defence against duplicate orders.
   positions; the local database is the record for persistence,
   execution tracking and recovery.
 
-### 7.3 Emergency stop
+### 7.3 Risk controls
+
+Every automatic execution passes risk checks in the Rust backend
+immediately before submission. The control set, at minimum:
+
+- maximum notional value per order;
+- maximum position per trading instrument;
+- maximum total position (exposure) per account;
+- maximum leverage;
+- maximum slippage;
+- minimum margin requirement;
+- maximum daily loss (a breach halts new executions for the day);
+- maximum signal latency (a signal older than the limit when it is
+  about to be executed is not executed);
+- API anomaly circuit breaker (repeated exchange API errors or
+  inconsistent responses halt automatic execution until cleared);
+- the global emergency stop (§7.4).
+
+A failed check blocks the order and is recorded with the failed
+control and the values involved; a blocked order is never silently
+dropped. Phase 5 of the development plan implements these controls
+and proves each one in Paper Trading.
+
+### 7.4 Emergency stop
 
 Emergency stop, by default, blocks opening new positions and adding to
 existing ones. Cancelling orders and closing positions are separate,
 explicit operations; emergency stop is never silently equivalent to an
 unconditional market close-out.
 
-### 7.4 Startup recovery
+### 7.5 Startup recovery
 
 Startup order (target architecture):
 
@@ -296,7 +389,7 @@ Startup order (target architecture):
 
 Until recovery completes, opening new positions is forbidden.
 
-### 7.5 Safety testing
+### 7.6 Safety testing
 
 Planned from the phase that introduces execution (development plan
 Phases 2, 5 and 6): Paper Trading, duplicate-signal injection,
@@ -320,7 +413,22 @@ owner explicitly approves it.
   permissions and must not have withdrawal permission. What each
   exchange actually supports must be verified against its official API
   documentation (Phase 3).
-- Encrypted key material lives under `data/keys/`.
+- Storage layout (default design): encrypted key files live under
+  `data/keys/`, one file per account secret. The `accounts` table
+  stores only the key-file reference and metadata (which account,
+  which exchange, file name, format version) — never the secret
+  itself.
+- Key file format: a versioned encrypted envelope holding the format
+  version, the Argon2id parameters used, the salt, the nonce and the
+  ciphertext, so a future format version is recognised and migrated
+  instead of guessed.
+- Backups: a backup is complete only if it contains the database, the
+  key files, the Telegram sessions and the other runtime data needed
+  to restore the application. The SQLite part must be produced with a
+  WAL-consistent method (the SQLite Online Backup API or
+  `VACUUM INTO`), never by copying `deact.db` alone while WAL is in
+  use — the `-wal` file can hold committed transactions the main file
+  does not yet contain.
 
 ## 9. SQLite data model plan
 
@@ -332,16 +440,16 @@ current foundation.
 
 | Table | Purpose |
 |---|---|
-| `accounts` | Exchange accounts (no plaintext secrets; encrypted material in `data/keys/` or an encrypted column) |
-| `signals` | Raw signals as received (§5.2 fields) |
-| `signal_events` | Lifecycle events of a signal (received, parsed, rejected, executed, …) |
-| `parsed_signals` | Normalised signals produced from raw signals |
+| `accounts` | Exchange accounts (no plaintext secrets; stores the `data/keys/` key-file reference and metadata, §8) |
+| `signal_sources` | Signal source configuration and instances (type, instance identity, source-specific settings, enabled state) |
+| `signal_events` | Raw messages and source events as received (the §5.2 raw-record fields) |
+| `parsed_signals` | Normalised Signals (§5.2) parsed from `signal_events` |
 | `copy_configs` | Copy-trading rules per source/account pair |
 | `orders` | Local orders with full lifecycle state (§7.1) |
 | `fills` | Individual executions, linked to orders |
 | `positions` | Current known positions per account/instrument |
 | `trades` | Completed trade records derived from fills |
-| `signal_logs` | Audit log of signal handling decisions |
+| `signal_logs` | Audit of signal handling and execution decisions |
 | `settings` | Application settings key/value |
 
 ### 9.2 Model rules
@@ -355,9 +463,10 @@ current foundation.
   uniqueness is enforced in the schema where the domain requires it
   (e.g. one local order per idempotency identifier; one fill per
   exchange fill ID).
-- **Signal idempotency:** a signal's idempotency identity is
+- **Signal idempotency:** a raw message's idempotency identity is
   (source type, source instance, original message ID), enforced with a
-  unique constraint so a redelivered message cannot be processed twice.
+  unique constraint on `signal_events` so a redelivered message cannot
+  be processed twice.
 - **Order/fill relations:** `fills.order_id` references the local
   order; each order stores both the local order ID and the exchange's
   order ID, so local records, exchange orders and fills can always be
@@ -374,7 +483,7 @@ current foundation.
 - **Recovery fields:** orders persist their lifecycle state, the
   idempotency identifier, the exchange order ID, submitted parameters,
   and last-known fill totals, so the Recovery Manager can resume and
-  reconcile after any crash (§7.4).
+  reconcile after any crash (§7.5).
 
 ### 9.3 Current storage implementation (status)
 
@@ -446,8 +555,10 @@ Based on reading the actual code in PR #1 (not on file names).
   and the guard-based flush on shutdown.
 - `src/config/` — the load-or-create TOML configuration approach and
   the rule that a corrupt file is an error and is never overwritten.
-- `src/runtime/` — the pattern of a background Tokio runtime owned
-  outside the UI, driven by a bounded channel with orderly shutdown.
+- `src/runtime/` — the design ideas: bounded channels with explicit
+  overload behaviour, a supervisor task, a ping health check, orderly
+  shutdown. The standalone runtime itself is not carried over (§11 B);
+  the ideas are re-expressed on Tauri's async runtime (§4).
 - All existing tests (`tests/paths_tests.rs`, `config_tests.rs`,
   `storage_tests.rs`, `runtime_tests.rs` and the in-module unit tests)
   — they keep covering the reused modules.
@@ -463,10 +574,14 @@ Based on reading the actual code in PR #1 (not on file names).
 - `src/app/` (eframe/egui window) — replaced by the Tauri Desktop Shell
   plus the Svelte frontend. egui is not part of the target stack.
 - `src/main.rs` — replaced by the Tauri application entry point
-  (`Builder`, generated context, runtime-set `appDirectoriesOverride`
-  and/or explicit window `data_directory` per §3.3). The ordered
+  (`Builder`, generated context, runtime-set `appDirectoriesOverride`,
+  and the main window created from Rust with
+  `WebviewWindowBuilder::data_directory` per §3.3). The ordered
   startup sequence it implements is re-expressed in the Application
-  Layer and extended into the §7.4 recovery sequence.
+  Layer and extended into the §7.5 recovery sequence.
+- `src/runtime/`'s standalone Tokio runtime — replaced by the async
+  runtime provided by Tauri (§4). No second independent runtime is
+  created by default.
 - The data-directory layout — `DeACT_Data/` becomes `data/`, with the
   new subdirectories `sessions/telegram/`, `keys/` and `webview/`
   added; `paths` gains these locations.
@@ -478,15 +593,15 @@ Based on reading the actual code in PR #1 (not on file names).
 
 ### C. To verify during migration (Phase 1 unless noted)
 
-- How the existing Rust modules integrate with the Tauri runtime
-  (ownership of `DbWorker` and the Tokio runtime: Tauri also manages a
-  runtime; the two must not fight — e.g. backend services on DeACT's
-  own Tokio runtime, Tauri commands as thin adapters).
+- How the existing Rust modules integrate with Tauri (ownership of
+  `DbWorker`, shutdown ordering between the Tauri window lifecycle and
+  backend services). The runtime question is decided (§4): backend
+  services run on Tauri's async runtime.
 - Whether the SQLite worker needs changes for Tauri (thread ownership,
   shutdown ordering with window lifecycle).
-- The exact landing spot of the WebView2 user data folder under
-  `appDirectoriesOverride` on a real Windows machine, and whether the
-  explicit builder `data_directory` is needed (§3.3).
+- The exact landing spot of the WebView2 user data folder on a real
+  Windows machine under the decided builder `data_directory` (§3.3),
+  including whether any WebView2 component writes outside it.
 - Every path a plugin or third-party dependency writes to (store,
   log, updater, HTTP caches, WebView2 caches) — anything resolving
   paths outside the Tauri path APIs escapes the override.
