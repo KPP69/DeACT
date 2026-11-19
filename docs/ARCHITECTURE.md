@@ -36,32 +36,52 @@ product does not need.
 
 ## 2. Current implementation status
 
-The current branch (`feature/windows-app-foundation`, PR #1) contains an
-**eframe/egui foundation**, built before the Tauri decision. It is an
-engineering base, not the product:
+The current branch (`feature/windows-app-foundation`, PR #1) contains
+the **Phase 1 Tauri 2 foundation** described in
+`docs/DEVELOPMENT_PLAN.md`: the eframe/egui foundation has been replaced
+by the target stack. It is an engineering base, not the product:
 
-Implemented and tested today:
+Implemented in Phase 1:
 
+- Tauri 2 application shell (Rust backend in `src-tauri/`) with a
+  Svelte + TypeScript frontend: a six-page navigation skeleton
+  (Overview, Trading, Copy Config, Signals, Accounts, Settings) in the
+  §10 dark terminal style, with the overview page reading a backend
+  status snapshot through a Tauri Command.
 - Portable data-directory resolution from `current_exe()` with a
-  writability probe and no fallback (currently creating `DeACT_Data/`).
-- Minimal TOML configuration (corrupt files are errors, never silently
+  writability probe and no fallback, creating the `data/` layout of
+  §3.1 (`config/`, `logs/`, `cache/`, `backups/`, `sessions/telegram/`,
+  `keys/`, `webview/`).
+- Per-directory `appDirectoriesOverride` installed at runtime through
+  `Context::config_mut()` (config → `data/config/`, data → `data/`,
+  localData → `data/webview/`, cache → `data/cache/`, log →
+  `data/logs/`), and the main window created in Rust with
+  `WebviewWindowBuilder::data_directory` set to the absolute
+  `data/webview/` path (§3.3).
+- Minimal TOML configuration at `data/config/deact.toml` (application
+  level, non-sensitive only; corrupt files are errors, never silently
   overwritten).
 - `tracing` logging to console and file through a non-blocking writer.
 - A SQLite single-writer worker (bounded channel, WAL, `busy_timeout`,
   `meta` table with `schema_version = 1`, typed operations only, strict
-  initialisation rules — see §9.3).
-- A background Tokio runtime with a bounded command channel and a ping
-  health check.
-- A minimal eframe/egui status window (to be replaced, §11 B).
-- A Windows GUI-subsystem release build (no console window).
-- 20 automated tests, all passing; Windows x64 CI (fmt, clippy, tests,
-  MSVC release build, artifact upload).
+  initialisation rules — see §9.3), on its own synchronous thread.
+- Background task supervision (bounded channel, ping health check) on
+  the async runtime provided by Tauri; no second Tokio runtime.
+- Windows GUI startup error feedback per §3.6: native `MessageBoxW`
+  dialogs (pre-logging failures dialog-only, post-logging failures
+  `tracing::error!` plus dialog), with fault injection available only
+  in a separate `fault-injection` diagnostic build.
+- A Windows GUI-subsystem release build (no console window), produced
+  by Windows x64 CI (fmt, clippy, tests, frontend build, Tauri release
+  build, artifact upload).
 
-Not implemented: Tauri, the Svelte frontend, every business module in
-§4 (Signal Center, Account Center, Copy Engine, Exchange Adapters,
-Recovery Manager), the §9 data model beyond the `meta` table, key
-encryption, and any trading functionality. Real-money automated trading
-stays disabled until the product owner explicitly approves it.
+Not implemented: every business module in §4 (Signal Center, Account
+Center, Copy Engine, Exchange Adapters, Recovery Manager), the §9 data
+model beyond the `meta` table, key encryption, and any trading
+functionality. Real-money automated trading stays disabled until the
+product owner explicitly approves it. Phase 1's Windows 11
+real-machine acceptance is a separate step and is not claimed by CI
+success.
 
 ## 3. Portable delivery on Windows
 
@@ -174,6 +194,22 @@ Four different things are versioned, and they are locked separately:
   ≥ 2.12.0 — the versions that provide `appDirectoriesOverride` — and
   CI builds from the lockfiles, so the feature cannot silently
   disappear through drift or a downgrade.
+
+Phase 1 locking outcome (2026-11-20): the package manager is **npm**
+(`package-lock.json`, CI installs with `npm ci`). Rust direct
+dependencies use exact `=` constraints in `src-tauri/Cargo.toml` and are
+locked by the committed `src-tauri/Cargo.lock`: `tauri` 2.12.6,
+`tauri-build` 2.7.5, `tokio` 1.53.3, `rusqlite` 0.43.0, `windows-sys`
+0.61.2 (Windows only). npm dependencies are exact in `package.json`:
+`@tauri-apps/api` 2.12.5, `svelte` 5.58.0; devDependencies
+`@tauri-apps/cli` 2.12.5, `vite` 8.3.8, `@sveltejs/vite-plugin-svelte`
+7.3.1, `typescript` 6.0.3, `svelte-check` 4.7.8, `@tsconfig/svelte`
+5.0.9. TypeScript stays on 6.x because the Svelte language tooling
+peers TypeScript ^5/^6 — TypeScript 7 does not yet ship the stable
+programmatic API those tools embed. The Rust crate (2.12.6) and the JS
+API (2.12.5) are on the same 2.12 minor, which is what Tauri's
+build-time version check requires; patch versions are locked
+independently, as decided for Phase 1.
 
 ### 3.6 Startup failure feedback (Windows GUI)
 
@@ -617,22 +653,33 @@ Based on reading the actual code in PR #1 (not on file names).
 
 ### C. To verify during migration (Phase 1 unless noted)
 
-- How the existing Rust modules integrate with Tauri (ownership of
-  `DbWorker`, shutdown ordering between the Tauri window lifecycle and
-  backend services). The runtime question is decided (§4): backend
-  services run on Tauri's async runtime.
-- Whether the SQLite worker needs changes for Tauri (thread ownership,
-  shutdown ordering with window lifecycle).
+Resolved in Phase 1 (2026-11-20):
+
+- Module integration and ownership: the `DbWorker` is owned by the
+  startup flow in the library's `run()` and is shut down after
+  `Builder::run` returns (and before exiting on a run failure); the
+  supervisor lives in Tauri managed state for the app's lifetime;
+  background async work runs on Tauri's async runtime (§4).
+- Configuration: the TOML configuration stays, at
+  `data/config/deact.toml`, holding application-level non-sensitive
+  settings only. The formal role of the SQLite `settings` table is
+  decided in Phase 2; TOML and SQLite must never both be the
+  authoritative source for the same setting.
+- Package manager and exact dependency versions: npm, recorded in §3.5.
+
+Still to verify:
+
 - The exact landing spot of the WebView2 user data folder on a real
   Windows machine under the decided builder `data_directory` (§3.3),
   including whether any WebView2 component writes outside it.
+  (Phase 1 real-machine acceptance.)
 - Every path a plugin or third-party dependency writes to (store,
   log, updater, HTTP caches, WebView2 caches) — anything resolving
-  paths outside the Tauri path APIs escapes the override.
+  paths outside the Tauri path APIs escapes the override. Phase 1
+  introduces no Tauri plugins, so this audit currently covers Tauri
+  itself and WebView2; it must be repeated whenever a plugin is added.
 - Windows x64 build of the full Tauri + Svelte stack and the exact
   dependency set it produces (WebView2 loader, redistributables).
-- Whether the TOML configuration stays, moves into the `settings`
-  table, or both — decided in Phase 1 and recorded here afterwards.
 - Telegram MTProto crate selection (Phase 4, decided by ChatGPT, §5.3).
 - Exchange API capabilities and permission models (Phases 3 and 6,
   verified against official documentation, §6 and §8).

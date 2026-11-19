@@ -90,6 +90,21 @@ after logging initialisation shows the dialog and leaves a
 any secret material; (5) the Release GUI build reports these failures
 without any console output.
 
+**Implementation record (2026-11-20).** Phase 1 was implemented on the
+existing branch as planned: the eframe/egui foundation was replaced by
+the Tauri 2 + Svelte stack in the standard layout (`src-tauri/` backend,
+frontend at the repository root); `paths`, `storage`, `logging` and
+`config` were migrated with their behaviour and tests intact (the data
+layout changed to `data/` with the configuration at
+`data/config/deact.toml`); the standalone Tokio runtime was replaced by
+a supervisor on Tauri's async runtime; the §3.6 error feedback is
+implemented with `MessageBoxW` behind a dedicated module, and fault
+injection exists only in the separate `fault-injection` diagnostic
+build. Locked versions and the npm decision are recorded in
+ARCHITECTURE.md §3.5. Code-level tests and the Windows x64 CI build are
+part of the delivery; the real-machine acceptance above remains the
+product owner's step and is not replaced by CI success.
+
 ## Phase 2 — Core data model, normalised signals, order state machine, recovery mechanism
 
 **Goal.** The persistent core of the trading system exists and is
