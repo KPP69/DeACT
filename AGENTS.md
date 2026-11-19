@@ -26,7 +26,8 @@ These rules apply to every AI agent and contributor. This file is the long-term 
 - One modular, single-process, monolithic desktop application. No microservices, Docker, Kubernetes, Redis, Kafka, NATS or local web server without a documented and approved requirement.
 - Core business logic must not depend on the UI.
 - Core: Rust. Tokio for asynchronous network work.
-- UI: eframe/egui, pure Rust native desktop. No browser or WebView/WebView2 runtime dependency.
+- Async runtime: application background tasks run on the async runtime provided by Tauri (Tokio). Do not create a second, independent Tokio runtime by default.
+- UI: Tauri 2 desktop shell with a Svelte + TypeScript frontend and plain CSS. On Windows, Tauri renders through the system WebView2 Runtime; DeACT accepts the WebView2 Runtime present on the system and does not bundle it. The WebView2 user data folder is application data and must be stored under `data/webview/` (see §9).
 - Persistence: SQLite. Use one controlled write path; WAL does not make SQLite multi-writer.
 - Modules must have clear responsibilities and interfaces. Use small cohesive modules; no speculative abstraction and no generic plugin system.
 - The core copy-trading logic must not depend on any specific signal source or on any specific exchange API implementation.
@@ -52,7 +53,13 @@ These rules apply to every AI agent and contributor. This file is the long-term 
 ## 5. Unified signal model
 
 - Every signal source must be converted to one unified standard signal model. Source-specific information may be kept in extension fields, but must not break the unified core model.
-- The unified model must at least contain: signal unique identifier, signal source type, signal source instance identifier, trader identifier, original message identifier, original message content, receive time, source time, exchange, trading pair, trading direction, trading intent, target position or position change, take-profit and stop-loss information, and parse status.
+- The unified model must at least contain: signal ID, source type, source instance ID, trader ID, original message ID, original message content, exchange, trading instrument/symbol, direction, action, quantity, quantity semantics, target position or position delta, leverage, entry price/price conditions, take profit, stop loss, source timestamp, receive timestamp, and parse status.
+- `action` covers at least Open, Close, Add, Reduce, LeverageChange and Cancel.
+- Quantity semantics must state explicitly what a quantity means (base amount, quote amount, balance fraction or position fraction); it must never be inferred implicitly.
+- Target position and position delta are different trading instructions and must never be conflated; a signal must state explicitly which of the two it uses.
+- Not every signal needs every field, but every field's semantics are fixed.
+- A message whose trading intent cannot be determined must be recorded with a failed or ambiguous parse status, must never be executed automatically, and must remain available for manual review.
+- A signal-source adapter must never place orders directly and must never operate a copy-trading account directly (see §4).
 
 ## 6. Exchange adapters
 
@@ -84,15 +91,15 @@ These rules apply to every AI agent and contributor. This file is the long-term 
 ## 9. Portable delivery and storage
 
 - The final product must be a portable Windows 11 x64 single executable: the initial delivery directory contains only `DeACT.exe`.
-- On first launch, `DeACT_Data/` must be created automatically beside the executable.
-- All runtime data must be stored under `DeACT_Data/`, including the database, configuration, account information, API keys, Telegram Session, other signal-source authentication information, logs, cache, backups and recovery state.
-- The database and SQLite WAL/SHM files must stay under `DeACT_Data/database`.
-- Backups must stay under `DeACT_Data/backups` and must be consistent with SQLite state. Database migrations are versioned; back up before migration.
+- On first launch, `data/` must be created automatically beside the executable.
+- All runtime data must be stored under `data/`, including the database, configuration, account information, API keys, Telegram Session, other signal-source authentication information, logs, cache, backups and recovery state.
+- The database is `data/deact.db`; its SQLite WAL/SHM files stay beside it under `data/`.
+- Backups must stay under `data/backups` and must cover the database, the encrypted key files under `data/keys/`, Telegram Sessions and the other runtime data needed to restore the application. A SQLite backup must use a method that is consistent with WAL state; copying the main database file alone is not a valid backup. Database migrations are versioned; back up before migration.
 - Resolve the data root from the executable path, never from the current working directory. Centralise paths in one portable-paths module and inject paths into services.
 - Never write program data to AppData, LocalAppData, Documents, the Registry or any other system directory. Never silently fall back to any of those directories.
 - If the executable directory is not writable, report the problem clearly and exit. Never fall back silently to another directory.
-- Disable or redirect framework-managed persistence explicitly.
-- Updates replace the executable only; never overwrite `DeACT_Data`.
+- Disable or redirect framework-managed persistence (including the WebView2 user data folder) explicitly into `data/`.
+- Updates replace the executable only; never overwrite `data/`.
 - The source tree is not included in the end-user package.
 - No telemetry, crash upload, cloud sync or external data storage by default.
 - Portability and runtime dependencies must be verified by actual build and run, not assumed.

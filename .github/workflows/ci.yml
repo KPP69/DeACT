@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "feature/**"
+  pull_request:
+    branches:
+      - "foundation/portable-core"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: Windows x64 (MSVC)
+    runs-on: windows-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install Rust 1.100.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies (locked)
+        run: npm ci
+
+      - name: Generate app icons from the SVG source
+        run: npm run tauri -- icon src-tauri/icons/icon.svg
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Frontend type check
+        run: npm run check
+
+      - name: Check formatting
+        working-directory: src-tauri
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        working-directory: src-tauri
+        run: cargo test --all-targets
+
+      - name: Tauri release build (portable exe, no installer)
+        run: npm run tauri build -- --no-bundle
+
+      - name: Upload DeACT.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeACT-windows-x64
+          path: src-tauri/target/release/deact.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      # Diagnostic build with the fault-injection feature, used only to
+      # verify the startup error dialogs on a real Windows machine.
+      # This is not a release build and must never be shipped as one.
+      - name: Diagnostic build (fault injection, not a release)
+        run: npm run tauri build -- --no-bundle --features fault-injection
+
+      - name: Upload diagnostic artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeACT-windows-x64-diagnostic
+          path: src-tauri/target/release/deact.exe
+          if-no-files-found: error
+          retention-days: 14
