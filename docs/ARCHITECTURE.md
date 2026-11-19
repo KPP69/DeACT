@@ -175,6 +175,30 @@ Four different things are versioned, and they are locked separately:
   CI builds from the lockfiles, so the feature cannot silently
   disappear through drift or a downgrade.
 
+### 3.6 Startup failure feedback (Windows GUI)
+
+DeACT is a Windows GUI-subsystem application: a Release build has no
+console, so startup failures must never rely on console output
+(`eprintln!`, stdout) as the user-facing channel.
+
+- A startup failure that happens **before** logging is initialised is
+  shown to the user in a native Windows error dialog (for example via
+  `MessageBoxW`).
+- A startup failure that happens **after** logging is initialised is
+  recorded with `tracing::error!` **and** shown in the same native
+  error dialog.
+- The message states which startup stage failed and what the user can
+  do about it. It must never contain secrets — no keys, passwords,
+  sessions or other sensitive material.
+- After the failure is reported, the process exits as specified for
+  that failure. It never ignores a startup failure silently, and it
+  never falls back to AppData, LocalAppData or any other system
+  directory to "keep going".
+
+This is a requirement for the Tauri application, implemented in
+Phase 1 of the development plan with its own acceptance cases; the
+eframe foundation predates it.
+
 ## 4. Architecture layers
 
 DeACT is a modular monolith. Core business logic lives in the Rust
