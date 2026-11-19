@@ -12,6 +12,16 @@
 //! Any failure in steps 1–5 is reported and exits the process; the program
 //! never continues with an incomplete startup state.
 
+// The Windows release build is a GUI-subsystem application: double-clicking
+// DeACT.exe opens only the native window, with no console window attached.
+// Debug builds keep the console subsystem so startup output stays visible
+// during development. The file logger under `DeACT_Data/logs/` is unaffected
+// either way; the attribute does not apply to non-Windows targets.
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 use deact::app::{self, AppStatus};
 use deact::config;
 use deact::logging;
