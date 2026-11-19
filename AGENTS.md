@@ -53,7 +53,13 @@ These rules apply to every AI agent and contributor. This file is the long-term 
 ## 5. Unified signal model
 
 - Every signal source must be converted to one unified standard signal model. Source-specific information may be kept in extension fields, but must not break the unified core model.
-- The unified model must at least contain: signal unique identifier, signal source type, signal source instance identifier, trader identifier, original message identifier, original message content, receive time, source time, exchange, trading pair, trading direction, trading intent, target position or position change, take-profit and stop-loss information, and parse status.
+- The unified model must at least contain: signal ID, source type, source instance ID, trader ID, original message ID, original message content, exchange, trading instrument/symbol, direction, action, quantity, quantity semantics, target position or position delta, leverage, entry price/price conditions, take profit, stop loss, source timestamp, receive timestamp, and parse status.
+- `action` covers at least Open, Close, Add, Reduce, LeverageChange and Cancel.
+- Quantity semantics must state explicitly what a quantity means (base amount, quote amount, balance fraction or position fraction); it must never be inferred implicitly.
+- Target position and position delta are different trading instructions and must never be conflated; a signal must state explicitly which of the two it uses.
+- Not every signal needs every field, but every field's semantics are fixed.
+- A message whose trading intent cannot be determined must be recorded with a failed or ambiguous parse status, must never be executed automatically, and must remain available for manual review.
+- A signal-source adapter must never place orders directly and must never operate a copy-trading account directly (see §4).
 
 ## 6. Exchange adapters
 
