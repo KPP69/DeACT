@@ -1,10 +1,26 @@
 # Rust build output
 /target/
+src-tauri/target/
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# Tauri generated schemas
+src-tauri/gen/
+
+# App icons are generated from src-tauri/icons/icon.svg during the build
+# (see the CI workflow); only the SVG source is kept in the repository.
+src-tauri/icons/*
+!src-tauri/icons/icon.svg
 
 # DeACT portable runtime data (created beside DeACT.exe at first launch).
 # Never commit local databases, logs, caches, backups or credentials.
-/DeACT_Data/
-DeACT_Data/
+/data/
+data/
 *.db
 *.db-wal
 *.db-shm
