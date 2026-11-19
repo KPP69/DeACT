@@ -57,6 +57,12 @@ byte of its data under `data/` beside the executable.
 - Basic UI shell: the six-page navigation skeleton (ARCHITECTURE.md
   §10 palette) with a status page showing data directory, schema
   version and runtime state through Tauri Commands/Events.
+- Startup failure feedback for the GUI build (ARCHITECTURE.md §3.6):
+  a native Windows error dialog (for example `MessageBoxW`) for
+  failures before logging is initialised; `tracing::error!` plus the
+  dialog for failures afterwards. Messages name the failed stage and
+  the remedy, contain no secrets, and the process then exits without
+  any directory fallback.
 - Decide and record: TOML config vs the `settings` table (§11 C).
 - Extend CI: frontend build + Tauri release build + artifact upload.
 
@@ -66,14 +72,23 @@ lists agreed.
 **Test requirements.** All reused-module tests keep passing; new tests
 for the `data/` layout creation; a scripted Windows run that lists
 every file created outside `data/` (must be none attributable to
-DeACT); startup with an unwritable executable directory fails with a
-clear error.
+DeACT); startup-failure drills on Windows covering the acceptance
+cases below (unwritable data directory, pre-logging failure,
+post-logging failure, secret-free messages).
 
 **Acceptance criteria.** Double-clicking the built `DeACT.exe` on a
 real Windows 11 machine opens the Tauri window with no console window;
 `data/` is created beside the exe; the WebView2 user data folder is
 verified to be inside `data/`; no DeACT writes appear in AppData,
 LocalAppData, Documents or the Registry during a run; CI is green.
+Startup failure feedback (§3.6) is demonstrated on the same machine:
+(1) with the data directory made unwritable, startup shows the native
+error dialog and the process exits; (2) a simulated failure before
+logging initialisation still shows the dialog; (3) a simulated failure
+after logging initialisation shows the dialog and leaves a
+`tracing::error!` record; (4) neither the dialog nor the log contains
+any secret material; (5) the Release GUI build reports these failures
+without any console output.
 
 ## Phase 2 — Core data model, normalised signals, order state machine, recovery mechanism
 
