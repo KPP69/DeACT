@@ -32,20 +32,28 @@ byte of its data under `data/` beside the executable.
 
 **Scope.**
 
-- Scaffold the Tauri 2 application (Tauri ≥ 2.12.0, pinned; see
-  ARCHITECTURE.md §3.3) with a Svelte + TypeScript frontend and plain
-  CSS; no component library, no extra state framework.
+- Scaffold the Tauri 2 application (Tauri ≥ 2.12.0; versions locked
+  per ARCHITECTURE.md §3.5) with a Svelte + TypeScript frontend and
+  plain CSS; no component library, no extra state framework.
 - Set `app > appDirectoriesOverride` (config or runtime via
-  `Context::config_mut`) to the `data/` root; create the main window
-  from Rust, deciding the WebView2 data-folder mechanism (§3.3) and
-  pointing it at `data/webview/`.
+  `Context::config_mut`) to the `data/` root for the Tauri
+  app-directory APIs; create the main window from Rust with
+  `WebviewWindowBuilder::data_directory` set to the absolute
+  `<executable directory>/data/webview/` path (§3.3).
 - Rename the portable layout from `DeACT_Data/` to `data/` with
   `sessions/`, `keys/`, `logs/`, `backups/`, `webview/` subdirectories;
   keep the `current_exe()` + writability-probe + no-fallback behaviour.
-- Move the existing `paths`, `storage`, `logging`, `config` and
-  `runtime` modules into the Tauri backend (Application Layer owns
-  them; Tauri commands stay thin). Decide how DeACT's Tokio runtime
-  coexists with Tauri's runtime.
+- Move the existing `paths`, `storage`, `logging` and `config` modules
+  into the Tauri backend (Application Layer owns them; Tauri commands
+  stay thin). Backend async work runs on Tauri's async runtime — no
+  second Tokio runtime is created; the foundation runtime's
+  bounded-channel, supervisor and health-check patterns are
+  re-expressed there, and the SQLite worker remains a dedicated
+  synchronous thread.
+- Lock versions per ARCHITECTURE.md §3.5: the Rust side in
+  `Cargo.lock`; `@tauri-apps/api` and the Tauri CLI in the frontend
+  lockfile of the package manager chosen in this phase (the choice is
+  recorded); CI installs from both lockfiles in frozen/immutable mode.
 - Basic UI shell: the six-page navigation skeleton (ARCHITECTURE.md
   §10 palette) with a status page showing data directory, schema
   version and runtime state through Tauri Commands/Events.
@@ -74,18 +82,18 @@ provably consistent before any exchange or signal source is connected.
 
 **Scope.**
 
-- Implement the ARCHITECTURE.md §9 schema (accounts, signals,
+- Implement the ARCHITECTURE.md §9 schema (accounts, signal_sources,
   signal_events, parsed_signals, copy_configs, orders, fills,
   positions, trades, signal_logs, settings) through ordered,
   transactional schema migrations on top of `meta.schema_version`.
-- Implement the normalised signal model (§5.2) and the raw-signal
-  record with its idempotency identity and unique constraint.
+- Implement the normalised signal model (§5.2) and the raw record in
+  `signal_events` with its idempotency identity and unique constraint.
 - Implement the order lifecycle state machine (§7.1) as pure,
   testable transitions in the Copy Engine core, with the
   timeout → query-first rule encoded in the executor interface.
 - Implement the Recovery Manager's local half: detecting unfinished
   orders at startup, the recovery gate that blocks new executions
-  until recovery completes (§7.4), and reconciliation data structures
+  until recovery completes (§7.5), and reconciliation data structures
   (the exchange side is stubbed behind the `Exchange` trait).
 
 **Prerequisites.** Phase 1 accepted.
@@ -113,7 +121,10 @@ AsterDEX read-only.
 - Account Center: account CRUD (ARCHITECTURE.md §4), stored per §9.
 - Key vault: AES-256-GCM + Argon2id (random salt and nonce), master
   password set/unlock flow, `zeroize`-style clearing, unlock-failure
-  lockout of any execution state (§8).
+  lockout of any execution state (§8). Key files use the versioned
+  envelope format of §8 (format version, Argon2id parameters, salt,
+  nonce, ciphertext) and live in `data/keys/`; `accounts` stores only
+  the key-file reference and metadata.
 - Exchange adapters (read scope): authentication/signing, balance and
   position queries, order/fill status queries for Hyperliquid and
   AsterDEX, behind the unified `Exchange` trait (§6). No order
@@ -146,10 +157,10 @@ and parsed into normalised signals — without any trading execution.
   adopted.
 - Telegram source implementing the unified `SignalSource` abstraction:
   login, session persistence under `data/sessions/telegram/`,
-  reconnect, per-source configuration.
-- Raw message persistence (§5.2 fields) and the parser producing
-  `parsed_signals` for the six normalised kinds; unrecognisable
-  messages are recorded as unparseable, never guessed.
+  reconnect, per-source configuration stored in `signal_sources`.
+- Raw message persistence in `signal_events` (§5.2 fields) and the
+  parser producing `parsed_signals` for the six normalised kinds;
+  unrecognisable messages are recorded as unparseable, never guessed.
 - Signal Center UI wiring (page exists from Phase 1): source list,
   raw signal list, parse results.
 
@@ -175,9 +186,13 @@ simulated execution, with risk controls enforced.
 
 - Copy configuration per source/account pair (`copy_configs`):
   quantity modes and calculation, per-account and per-symbol limits.
-- Risk checks in the Copy Engine: max position, max order size,
-  leverage caps, emergency stop semantics (§7.3) — blocks opens/adds,
-  with cancel/close as separate explicit operations.
+- Risk controls (ARCHITECTURE.md §7.3) implemented in the Copy Engine:
+  maximum notional value per order, maximum position per instrument,
+  maximum total account exposure, maximum leverage, maximum slippage,
+  minimum margin requirement, maximum daily loss, maximum signal
+  latency, the API anomaly circuit breaker, and the global emergency
+  stop (§7.4) — blocks opens/adds, with cancel/close as separate
+  explicit operations.
 - Paper Trading executor implementing the `Exchange` trait interface
   used by the Copy Engine: simulated fills including partial fills,
   latency and timeout simulation hooks.
@@ -186,17 +201,23 @@ simulated execution, with risk controls enforced.
 
 **Prerequisites.** Phase 4 accepted.
 
-**Test requirements.** The §7.5 safety suite against Paper Trading:
+**Test requirements.** The §7.6 safety suite against Paper Trading:
 duplicate signals, request timeouts (query-first, no duplicate
 orders), partial fills, disconnect/reconnect, crash and restart
 recovery mid-position; risk-limit tests proving blocked orders are
-recorded with reasons.
+recorded with reasons. Plus one Paper Trading test per §7.3 control:
+an order breaching each limit is blocked and recorded with the failed
+control; a signal older than the latency limit is not executed;
+simulated repeated API anomalies trip the circuit breaker and halt
+execution; reaching the daily-loss limit halts new executions for the
+day.
 
 **Acceptance criteria.** The pipeline runs a full day of recorded
 signal fixtures with zero duplicate executions, zero risk-limit
 breaches, and a complete audit trail from raw signal to paper fill;
-emergency stop demonstrably blocks new opens while leaving cancel and
-close available.
+every §7.3 risk control demonstrably blocks its breaching scenario in
+Paper Trading with an audit record; emergency stop demonstrably
+blocks new opens while leaving cancel and close available.
 
 ## Phase 6 — Real exchange execution, order reconciliation, position recovery
 
@@ -211,7 +232,7 @@ real, with reconciliation and recovery proven under failure.
 - WebSocket account/order event streams with reconnect and
   resynchronisation; fills applied transactionally.
 - Recovery Manager completed: startup reconciliation against both
-  exchanges (§7.4 sequence), `Unknown / PendingReconciliation`
+  exchanges (§7.5 sequence), `Unknown / PendingReconciliation`
   resolution, position recovery.
 - Small-value live-fire procedure defined with the product owner;
   real-money execution remains off by default and is enabled only by
@@ -220,7 +241,7 @@ real, with reconciliation and recovery proven under failure.
 **Prerequisites.** Phase 5 accepted, including its full safety suite.
 
 **Test requirements.** Testnet end-to-end execution first; then the
-§7.5 suite repeated against testnet (timeouts, partial fills,
+§7.6 suite repeated against testnet (timeouts, partial fills,
 disconnects, crash/restart during an open order); reconciliation test
 with deliberately diverged local state proving the exchange wins.
 
@@ -243,7 +264,9 @@ with the performance and safety interaction rules implemented.
 - Copy Configuration and Signal Center completed (building on
   Phases 4–5 wiring).
 - Account Configuration completed (Phase 3 flows) and System Settings:
-  data directory info, log access, backup/restore of `data/`.
+  data directory info, log access, backup/restore of `data/`
+  (WAL-consistent database backup per ARCHITECTURE.md §8, including
+  key files and Telegram sessions).
 - Table performance: sticky headers, virtual scrolling for large
   lists; long operations run in the backend with progress, never
   blocking the UI; dangerous operations require second confirmation.
@@ -276,7 +299,7 @@ passes a full real-machine acceptance run.
   present/missing behaviour (clear error when missing), first-run
   directory creation, full write audit (nothing outside `data/`),
   upgrade by replacing the exe (data preserved), backup/restore.
-- Final acceptance run of the §7.5 safety suite on the packaged build
+- Final acceptance run of the §7.6 safety suite on the packaged build
   (Paper Trading mode), plus the Phase 6 testnet suite.
 - Documentation freeze: ARCHITECTURE.md and this plan updated to match
   the shipped implementation exactly.
